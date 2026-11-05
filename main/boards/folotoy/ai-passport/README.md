@@ -35,9 +35,28 @@ Outputs `build/merged-binary.bin` (8 MB flash, USB Serial/JTAG console).
 The three physical keys map to XiaoZhi's voice-assistant actions:
 
 - **OK** — single click: toggle the chat state (or enter Wi-Fi config mode
-  while starting up)
+  while starting up); in manual mode a second click ends the turn. Long press
+  (2 s): cycle the conversation mode realtime → auto → manual
 - **UP** — single click: volume +10; long press: max volume
 - **DOWN** — single click: volume -10; long press: mute
+
+## Conversation modes
+
+The mode is persisted in NVS (`conversation`/`mode`) and can also be set by
+voice through the MCP tools `self.conversation.set_mode` /
+`self.conversation.get_mode`.
+
+- **realtime** — full duplex. The ES8311 DAC loopback (right I2S slot) is
+  captured as the reference for the standalone esp-sr AEC
+  (`CONFIG_USE_DEVICE_AEC`); the AEC is only allocated in this mode, and the
+  WakeNet model is unloaded while it runs (they do not fit in RAM together).
+  If the AEC cannot be allocated (it needs ~58 KB plus a 40 KB reserve), the
+  device still runs realtime, without echo cancellation, and the wake word stays
+  available.
+- **auto** — half duplex; the server ends each turn and the device keeps
+  listening after every reply.
+- **manual** — click to start, click to send; idle after each reply. The
+  "你好小智" wake word starts a single auto-stop turn.
 
 Because the ladder shares one ADC pin, XiaoZhi reads it as three
 independent ADC buttons (the same pattern as the ESP-BOX-Lite).

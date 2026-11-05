@@ -70,6 +70,8 @@ void Application::Initialize() {
     // Setup the audio service
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
+    LoadConversationMode();
+    ApplyConversationModeAec();
     audio_service_.Start();
     ESP_LOGI(TAG, "After board/audio init");
     SystemInfo::PrintHeapStats();
@@ -636,7 +638,8 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (listening_mode_ == kListeningModeManualStop ||
+                            conversation_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -820,7 +823,13 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        if (listening_mode_ == kListeningModeManualStop) {
+            // Manual mode: second click ends the user's turn and waits for the reply
+            protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
+        } else {
+            protocol_->CloseAudioChannel();
+        }
     }
 }
 
@@ -920,7 +929,7 @@ void Application::HandleWakeWordDetectedEvent() {
             ;
 
         if (state == kDeviceStateListening) {
-            protocol_->SendStartListening(GetDefaultListeningMode());
+            protocol_->SendStartListening(GetWakeWordListeningMode());
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
@@ -928,7 +937,7 @@ void Application::HandleWakeWordDetectedEvent() {
         } else {
             // Play popup sound and start listening again
             play_popup_on_listening_ = true;
-            SetListeningMode(GetDefaultListeningMode());
+            SetListeningMode(GetWakeWordListeningMode());
         }
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
@@ -988,12 +997,12 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     }
     // Set the chat state to wake word detected
     protocol_->SendWakeWordDetected(wake_word);
-    SetListeningMode(GetDefaultListeningMode());
+    SetListeningMode(GetWakeWordListeningMode());
 #else
     // Set flag to play popup sound after state changes to listening
     // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
     play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
+    SetListeningMode(GetWakeWordListeningMode());
 #endif
 }
 
@@ -1190,8 +1199,88 @@ void Application::SetListeningMode(ListeningMode mode) {
     SetDeviceState(kDeviceStateListening);
 }
 
-ListeningMode Application::GetDefaultListeningMode() const {
-    return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+ListeningMode Application::GetDefaultListeningMode() {
+    auto mode = conversation_mode_.load();
+    if (mode == kListeningModeRealtime) {
+        if (aec_mode_ == kAecOff) {
+            return kListeningModeAutoStop;
+        }
+        if (aec_mode_ == kAecOnDeviceSide && !audio_service_.IsDeviceAecActive()) {
+            // Device AEC may have been refused (low RAM). Retry, and if it still
+            // cannot run, stay in realtime without echo cancellation (by design:
+            // the server is expected to cope with the speaker echo).
+            ApplyConversationModeAec();
+            if (!audio_service_.IsDeviceAecActive()) {
+                ESP_LOGW(TAG, "Device AEC unavailable, running realtime without AEC");
+            }
+        }
+    }
+    return mode;
+}
+
+ListeningMode Application::GetWakeWordListeningMode() {
+    // A wake word cannot be followed by a "stop" click, so manual mode uses a
+    // single auto-stop turn and returns to idle after the reply.
+    auto mode = GetDefaultListeningMode();
+    return mode == kListeningModeManualStop ? kListeningModeAutoStop : mode;
+}
+
+void Application::LoadConversationMode() {
+    // Persistent API: NVS namespace "conversation", key "mode"
+    // (0 = auto stop, 1 = manual stop, 2 = realtime; matches ListeningMode).
+    // Default to auto stop: realtime must be chosen explicitly because on
+    // RAM-constrained targets the AEC may not fit alongside everything else.
+    auto fallback = kListeningModeAutoStop;
+    Settings settings("conversation", false);
+    int32_t value = settings.GetInt("mode", fallback);
+    ListeningMode mode = fallback;
+    if (value == kListeningModeAutoStop || value == kListeningModeManualStop ||
+        value == kListeningModeRealtime) {
+        mode = static_cast<ListeningMode>(value);
+    }
+    if (mode == kListeningModeRealtime && aec_mode_ == kAecOff) {
+        mode = kListeningModeAutoStop;
+    }
+    conversation_mode_ = mode;
+    ESP_LOGI(TAG, "Conversation mode: %d", (int)mode);
+}
+
+void Application::ApplyConversationModeAec() {
+    if (aec_mode_ != kAecOnDeviceSide) {
+        return;
+    }
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
+    // AFE engines keep AEC on in every mode (it also helps wake word detection).
+    audio_service_.EnableDeviceAec(true);
+#else
+    // The lite engine only needs AEC for full duplex; release it otherwise.
+    audio_service_.EnableDeviceAec(conversation_mode_ == kListeningModeRealtime);
+#endif
+}
+
+void Application::SetConversationMode(ListeningMode mode) {
+    Schedule([this, mode]() {
+        auto target = mode;
+        if (target == kListeningModeRealtime && aec_mode_ == kAecOff) {
+            ESP_LOGW(TAG, "Realtime mode requires AEC, falling back to auto stop");
+            target = kListeningModeAutoStop;
+        }
+        if (target == conversation_mode_) {
+            return;
+        }
+        conversation_mode_ = target;
+        {
+            Settings settings("conversation", true);
+            settings.SetInt("mode", target);
+        }
+        ESP_LOGI(TAG, "Conversation mode changed to %d", (int)target);
+
+        // Restart any running conversation so the new mode starts cleanly
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+        ApplyConversationModeAec();
+    });
 }
 
 void Application::Reboot() {
@@ -1350,7 +1439,7 @@ void Application::SetAecMode(AecMode mode) {
                 display->ShowNotification(Lang::Strings::RTC_MODE_ON);
                 break;
             case kAecOnDeviceSide:
-                audio_service_.EnableDeviceAec(true);
+                ApplyConversationModeAec();
                 display->ShowNotification(Lang::Strings::RTC_MODE_ON);
                 break;
         }

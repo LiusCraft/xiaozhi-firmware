@@ -6,12 +6,16 @@
 
 #define TAG "Es8311AudioCodec"
 
-Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
-    gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk, bool pa_inverted) {
+Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
+                                   int input_sample_rate, int output_sample_rate, gpio_num_t mclk,
+                                   gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
+                                   gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk,
+                                   bool pa_inverted, bool input_reference) {
     duplex_ = true; // 是否双工
-    input_reference_ = false; // 是否使用参考输入，实现回声消除
-    input_channels_ = 1; // 输入通道数
+    // With input_reference, ES8311 routes ADC to the left slot and the DAC
+    // playback signal to the right slot (REG44 = 0x58), giving an AEC reference.
+    input_reference_ = input_reference;
+    input_channels_ = input_reference ? 2 : 1;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     pa_pin_ = pa_pin;
@@ -52,6 +56,8 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     es8311_cfg.hw_gain.pa_voltage = 5.0;
     es8311_cfg.hw_gain.codec_dac_voltage = 3.3;
     es8311_cfg.pa_reverted = pa_inverted_;
+    // Keep no_dac_ref = false (default): REG44 = 0x58 puts the DAC reference on
+    // the right slot. Mono reads only consume the left (ADC) slot.
     codec_if_ = es8311_codec_new(&es8311_cfg);
 
     if (codec_if_ == nullptr) {
@@ -93,7 +99,7 @@ void Es8311AudioCodec::UpdateDeviceState() {
 
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
-            .channel = 1,
+            .channel = (uint8_t)input_channels_,
             .channel_mask = 0,
             .sample_rate = (uint32_t)input_sample_rate_,
             .mclk_multiple = 0,
@@ -211,7 +217,21 @@ int Es8311AudioCodec::Read(int16_t* dest, int samples) {
 
 int Es8311AudioCodec::Write(const int16_t* data, int samples) {
     if (output_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
+        if (input_channels_ == 2) {
+            // The shared IN_OUT device runs in stereo when the reference slot is
+            // captured, so duplicate mono playback onto both slots. The buffer is
+            // reused across calls to avoid per-frame allocations.
+            stereo_output_buffer_.resize(samples * 2);
+            for (int i = 0; i < samples; i++) {
+                stereo_output_buffer_[i * 2] = data[i];
+                stereo_output_buffer_[i * 2 + 1] = data[i];
+            }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(
+                dev_, (void*)stereo_output_buffer_.data(), samples * 2 * sizeof(int16_t)));
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
+        }
     }
     return samples;
 }

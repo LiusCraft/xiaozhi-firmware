@@ -138,6 +138,8 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    // Whether device AEC is actually running (the lite engine may refuse it on low RAM)
+    bool IsDeviceAecActive();
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 

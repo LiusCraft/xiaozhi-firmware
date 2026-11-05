@@ -1,11 +1,12 @@
-#include "wifi_board.h"
-#include "display/lcd_display.h"
-#include "codecs/es8311_audio_codec.h"
 #include "application.h"
-#include "button.h"
-#include "config.h"
 #include "assets/lang_config.h"
+#include "button.h"
+#include "codecs/es8311_audio_codec.h"
+#include "config.h"
 #include "cw2017_battery_monitor.h"
+#include "display/lcd_display.h"
+#include "mcp_server.h"
+#include "wifi_board.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -76,6 +77,103 @@ private:
         app.ToggleChatState();
     }
 
+    static const char* ConversationModeName(ListeningMode mode) {
+        switch (mode) {
+            case kListeningModeRealtime:
+                return "realtime";
+            case kListeningModeManualStop:
+                return "manual";
+            default:
+                return "auto";
+        }
+    }
+
+    static const char* ConversationModeLabel(ListeningMode mode) {
+        switch (mode) {
+            case kListeningModeRealtime:
+                return "实时对话";
+            case kListeningModeManualStop:
+                return "手动对话";
+            default:
+                return "自动对话";
+        }
+    }
+
+    // Runs on the main task.
+    void ApplyConversationMode(ListeningMode mode) {
+        auto& app = Application::GetInstance();
+        if (mode == kListeningModeRealtime && !app.IsRealtimeSupported()) {
+            mode = kListeningModeAutoStop;
+        }
+        app.SetConversationMode(mode);
+        GetDisplay()->ShowNotification(ConversationModeLabel(mode));
+        if (mode == kListeningModeRealtime) {
+            // Runs after SetConversationMode() has applied the AEC request.
+            app.Schedule([this]() {
+                if (!Application::GetInstance().GetAudioService().IsDeviceAecActive()) {
+                    GetDisplay()->ShowNotification("实时对话(无回声消除)");
+                }
+            });
+        }
+    }
+
+    // realtime -> auto -> manual -> realtime (realtime skipped without AEC)
+    void CycleConversationMode() {
+        auto& app = Application::GetInstance();
+        ListeningMode next;
+        switch (app.GetConversationMode()) {
+            case kListeningModeRealtime:
+                next = kListeningModeAutoStop;
+                break;
+            case kListeningModeAutoStop:
+                next = kListeningModeManualStop;
+                break;
+            default:
+                next = app.IsRealtimeSupported() ? kListeningModeRealtime : kListeningModeAutoStop;
+                break;
+        }
+        ApplyConversationMode(next);
+    }
+
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool(
+            "self.conversation.set_mode",
+            "Set the conversation mode of the device.\n"
+            "- `realtime`: full-duplex continuous conversation; the user can interrupt by "
+            "speaking (requires AEC).\n"
+            "- `auto`: hands-free turn-taking; after each reply the device keeps listening.\n"
+            "- `manual`: the user clicks the OK button to start and stop speaking; the device "
+            "goes idle after each reply.\n"
+            "The current conversation ends after switching.",
+            PropertyList({Property("mode", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto value = properties["mode"].value<std::string>();
+                ListeningMode mode;
+                if (value == "realtime") {
+                    if (!Application::GetInstance().IsRealtimeSupported()) {
+                        return std::unexpected("realtime mode requires AEC, which is disabled");
+                    }
+                    mode = kListeningModeRealtime;
+                } else if (value == "auto") {
+                    mode = kListeningModeAutoStop;
+                } else if (value == "manual") {
+                    mode = kListeningModeManualStop;
+                } else {
+                    return std::unexpected("mode must be one of: realtime, auto, manual");
+                }
+                Application::GetInstance().Schedule(
+                    [this, mode]() { ApplyConversationMode(mode); });
+                return true;
+            });
+        mcp_server.AddTool("self.conversation.get_mode",
+                           "Get the current conversation mode: realtime, auto or manual.",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               return std::string(ConversationModeName(
+                                   Application::GetInstance().GetConversationMode()));
+                           });
+    }
+
     void InitializeButtons() {
         for (int i = 0; i < kAdcButtonNum; i++) {
             adc_button_[i] = nullptr;
@@ -136,6 +234,9 @@ private:
         auto ok = adc_button_[kAdcButtonOk];
         ok->OnClick([this]() {
             Application::GetInstance().Schedule([this]() { ToggleChat(); });
+        });
+        ok->OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() { CycleConversationMode(); });
         });
     }
 
@@ -222,22 +323,22 @@ public:
         InitializeSpi();
         InitializeDisplay();
         InitializeButtons();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(
-            codec_i2c_bus_,
-            I2C_NUM_0,
-            AUDIO_INPUT_SAMPLE_RATE,
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK,
-            AUDIO_I2S_GPIO_BCLK,
-            AUDIO_I2S_GPIO_WS,
-            AUDIO_I2S_GPIO_DOUT,
-            AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN,
-            AUDIO_CODEC_ES8311_ADDR);
+            codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR,
+            true,   // use_mclk
+            false,  // pa_inverted
+#if CONFIG_USE_DEVICE_AEC
+            true);  // capture the ES8311 DAC loopback as the AEC reference
+#else
+            false);
+#endif
         return &audio_codec;
     }
 

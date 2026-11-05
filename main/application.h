@@ -6,12 +6,13 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
-#include <string>
-#include <mutex>
-#include <deque>
-#include <memory>
-#include <functional>
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "protocol.h"
@@ -116,6 +117,18 @@ public:
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+
+    /**
+     * Conversation mode selected by the user (thread-safe, persisted in NVS):
+     * - kListeningModeRealtime: full duplex; the server decides when to reply. Uses device
+     *   AEC when it can be allocated, otherwise runs without echo cancellation
+     * - kListeningModeAutoStop: half duplex; server VAD ends each turn, then keeps listening
+     * - kListeningModeManualStop: click to start / click to stop; idle after each reply.
+     *   A wake word starts a single auto-stop turn.
+     */
+    void SetConversationMode(ListeningMode mode);
+    ListeningMode GetConversationMode() const { return conversation_mode_.load(); }
+    bool IsRealtimeSupported() const { return aec_mode_ != kAecOff; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     
@@ -138,6 +151,7 @@ private:
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
+    std::atomic<ListeningMode> conversation_mode_ = kListeningModeAutoStop;
     std::string last_error_message_;
     AudioService audio_service_;
     NotifyPlayer notify_player_;
@@ -182,8 +196,11 @@ private:
     void InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
-    ListeningMode GetDefaultListeningMode() const;
-    
+    ListeningMode GetDefaultListeningMode();
+    ListeningMode GetWakeWordListeningMode();
+    void LoadConversationMode();
+    void ApplyConversationModeAec();
+
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
 };

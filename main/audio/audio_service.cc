@@ -860,6 +860,18 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
 }
 
+bool AudioService::IsDeviceAecActive() {
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
+    return device_aec_enabled_;
+#else
+    // Initializing the engine also applies a deferred EnableDeviceAec() request.
+    if (!device_aec_enabled_ || !InitializeAudioEngine()) {
+        return false;
+    }
+    return static_cast<LiteAudioEngine*>(audio_engine_.get())->IsDeviceAecActive();
+#endif
+}
+
 bool AudioService::IsAfeWakeWord() {
     return audio_engine_initialized_ && audio_engine_->IsAfeWakeWord();
 }

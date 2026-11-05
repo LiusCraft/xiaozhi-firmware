@@ -11,6 +11,7 @@
 #include "audio_engine.h"
 
 class EspWakeWord;
+struct aec_handle_t;
 
 class LiteAudioEngine : public AudioEngine {
 public:
@@ -23,6 +24,9 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    // True only when the standalone AEC was actually created (it may be refused
+    // when internal RAM is too low).
+    bool IsDeviceAecActive();
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -48,6 +52,9 @@ private:
     std::unique_ptr<EspWakeWord> wake_word_;
     srmodel_list_t* models_list_ = nullptr;
     bool should_have_wake_word_ = false;
+    // WakeNet and AEC do not fit in internal RAM together on ESP32-C3, so the
+    // wake word is unloaded while AEC is active (realtime mode).
+    bool wake_word_suppressed_ = false;
     std::atomic<bool> wake_word_enabled_ = false;
     std::atomic<bool> voice_processing_enabled_ = false;
     int frame_samples_ = 0;
@@ -60,8 +67,25 @@ private:
     std::function<void(bool)> vad_state_change_callback_;
     std::string empty_wake_word_;
 
+    // Standalone esp-sr AEC (no AFE). Created only while device AEC is enabled
+    // and released when disabled so its memory is available to other modes.
+    aec_handle_t* aec_ = nullptr;
+    int aec_chunk_samples_ = 0;
+    int aec_fill_ = 0;
+    int16_t* aec_mic_ = nullptr;
+    int16_t* aec_ref_ = nullptr;
+    int16_t* aec_out_ = nullptr;
+    int64_t aec_time_us_ = 0;
+    int aec_frames_ = 0;
+    std::mutex aec_mutex_;
+
     bool CreateWakeWordLocked();
+    bool CreateAecLocked();
+    void DestroyAecLocked();
+    void ProcessAecLocked(const std::vector<int16_t>& data);
     void OutputRawAudio(const std::vector<int16_t>& data);
+    void OutputMono(const int16_t* data, size_t samples);
+    void FlushOutputLocked();
 };
 
 #endif
